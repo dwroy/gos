@@ -4,6 +4,7 @@ import (
     "log"
     "fmt"
     "errors"
+    "strings"
     "strconv"
 )
 
@@ -51,49 +52,56 @@ func SetMinConnNum(num int) {
 
 type Redis struct {
     state int
+    db int
     addr string
     conns chan *rconn
-    connHolder chan bool
+    connSlots chan bool
 }
 
-func New(ip string, port int) (*Redis, error) {
+func New(ip string, port, db int) (*Redis, error) {
     r := &Redis{
-        ServerStateOpen,
+        ServerStateOpen, db,
         fmt.Sprintf("%s:%d", ip, port),
         make(chan *rconn, idleConnNum),
         make(chan bool, maxConnNum),
     }
-
     for i := 0; i < minConnNum; i++ {
-        if conn, err := newRconn(r.addr); err == nil{
-            r.connHolder <- true
+        if conn, err := newRconn(r.addr, db); err == nil{
+            r.connSlots <- true
             r.conns <- conn
         }
     }
-
     if len(r.conns) == 0 {
         return nil, errors.New("redis: cannot connect to server")
     }
-
     return r, nil
 }
 
-func (r *Redis) fetchConn() *rconn {
+func (r *Redis) fetchConn() (*rconn, error) {
+    var conn *rconn
     select {
-    case conn := <-r.conns:
-        return conn
+    case conn = <-r.conns:
+        if conn.db != r.db {
+            _, err := conn.resp(fmt.Sprintf("SELECT %d", r.db))
+            if err != nil {
+                r.releaseConn(conn)
+                return nil, err
+            }
+            conn.db = r.db
+        }
     default:
         select {
-        case conn := <-r.conns:
-            return conn
-        case r.connHolder <- true:
-            conn, err := newRconn(r.addr)
+        case conn = <-r.conns:
+        case r.connSlots <- true:
+            var err error
+            conn, err = newRconn(r.addr, r.db)
             if err != nil {
-                <-r.connHolder
+                <-r.connSlots
+                return nil, err
             }
-            return conn
         }
     }
+    return conn, nil
 }
 
 func (r *Redis) releaseConn(conn *rconn) {
@@ -109,109 +117,30 @@ func (r *Redis) releaseConn(conn *rconn) {
 func (r *Redis) closeConn(conn *rconn) {
     if conn.state == ConnStateOpen {
         conn.Close()
-        <-r.connHolder
+        <-r.connSlots
     }
 }
 
+func (r *Redis) SetDB(db int) {
+    r.db = db
+}
+
 func (r *Redis) Exec(cmd string) ([]string, error) {
-    conn := r.fetchConn()
+    conn, err := r.fetchConn()
+    if err != nil {
+        return nil, err
+    }
     defer r.releaseConn(conn)
-    err := conn.write([]byte(cmd + "\r\n"))
-    if err != nil {
-        r.closeConn(conn)
-        return nil, err
-    }
-
-    resp, err := conn.readLine()
-    if err != nil {
-        r.closeConn(conn)
-        return nil, err
-    }
-
-    switch resp[0] {
-    case '+':
-        return []string{string(resp[1:])}, nil
-
-    case ':':
-        return []string{string(resp[1:])}, nil
-
-    case '$':
-        resp, err := conn.readLine()
-        if err != nil {
-            r.closeConn(conn)
-            return nil, err
-        }
-        return []string{string(resp)}, nil
-
-    case '*':
-        num, err := strconv.ParseInt(string(resp[1:]), 10, 32)
-        if err != nil {
-            return nil, errors.New("redis: bad response")
-        }
-
-        rets := make([]string, 0, num)
-        for i := 0; i < 2 * int(num); i++ {
-            resp, err := conn.readLine()
-            if err != nil {
-                r.closeConn(conn)
-                return nil, err
-            }
-            if resp[0] == '$' {
-                continue
-            }
-            rets = append(rets, string(resp))
-        }
+    rets, err := conn.resp(cmd)
+    if err == nil {
         return rets, nil
-
-    case '-':
-        return nil, errors.New("redis: " + string(resp[1:]))
     }
-
-    return nil, errors.New("redis: bad response")
+    r.closeConn(conn)
+    return nil, err
 }
 
 func (r *Redis) Set(key string, val interface{}) error {
     return r.SetExtra(key, val, 0, 0, "")
-}
-
-func (r *Redis) String(key string) string {
-    rets, err := r.Exec("GET " + key)
-    if err == nil && len(rets) > 0 {
-        return rets[0]
-    }
-    return ""
-}
-
-func (r *Redis) Int(key string) int64 {
-    ret := r.String(key)
-    num, _ := strconv.ParseInt(ret, 10, 64)
-    return num
-}
-
-func (r *Redis) Push(side bool, key string, vals ...interface{}) error {
-    var ph string
-    for i := 0; i < len(vals); i++ {
-        ph = ph + " %v"
-    }
-
-    var pre string
-    if side {
-        pre = "R"
-    } else {
-        pre = "L"
-    }
-
-    cmd := fmt.Sprintf("%sPUSH %s %s", pre, key, ph)
-    _, err := r.Exec(fmt.Sprintf(cmd, vals...))
-    return err
-}
-
-func (r *Redis) RPush(key string, vals ...interface{}) error {
-    return r.Push(true, key, vals...)
-}
-
-func (r *Redis) LPush(key string, vals ...interface{}) error {
-    return r.Push(false, key, vals...)
 }
 
 func (r *Redis) SetExtra(key string, val interface{}, ex, px int64, cond string) error {
@@ -229,8 +158,102 @@ func (r *Redis) SetExtra(key string, val interface{}, ex, px int64, cond string)
     return err
 }
 
+func (r *Redis) String(key string) string {
+    rets, err := r.Exec("GET " + key)
+    if err == nil && len(rets) > 0 {
+        return rets[0]
+    }
+    return ""
+}
+
+func (r *Redis) Int(key string) int64 {
+    ret := r.String(key)
+    num, _ := strconv.ParseInt(ret, 10, 64)
+    return num
+}
+
+func (r *Redis) LPush(key string, vals ...interface{}) int {
+    return r.push("LPUSH", key, vals...)
+}
+
+func (r *Redis) RPush(key string, vals ...interface{}) int {
+    return r.push("RPUSH", key, vals...)
+}
+
+func (r *Redis) push(cmd, key string, vals ...interface{}) int {
+    slots := make([]string, 0, len(vals))
+    for i := 0; i < len(vals); i++ {
+        slots = append(slots,  "%v")
+    }
+    cmd = fmt.Sprintf("%s %s %s", cmd, key, strings.Join(slots, " "))
+    rets, err := r.Exec(fmt.Sprintf(cmd, vals...))
+    if err == nil && len(rets) > 0 {
+        num, _ := strconv.ParseInt(rets[0], 10, 64)
+        return int(num)
+    }
+    return 0
+}
+
+func (r *Redis) LRange(key string, start, end int64) []string {
+    cmd := fmt.Sprintf("LRANGE %s %d %d", key, start, end)
+    rets, _ := r.Exec(cmd)
+    return rets
+}
+
+func (r *Redis) LPop(key string) string {
+    return r.pop("LPOP", key)
+}
+
+func (r *Redis) RPop(key string) string {
+    return r.pop("RPOP", key)
+}
+
+func (r *Redis) pop(cmd, key string) string {
+    rets, err := r.Exec(cmd + " " + key)
+    if err == nil && len(rets) > 0 {
+        return rets[0]
+    }
+    return ""
+}
+
+func (r *Redis) BLPop(key string, sec int) string {
+    return r.bpop("BLPOP", key, sec)
+}
+
+func (r *Redis) BRPop(key string, sec int) string {
+    return r.bpop("BRPOP", key, sec)
+}
+
+func (r *Redis) bpop(cmd, key string, sec int) string {
+    rets, err := r.Exec(fmt.Sprintf("%s %s %d", cmd, key, sec))
+    if err == nil && len(rets) == 2 {
+        return rets[1]
+    }
+    return ""
+}
+
+func (r *Redis) SAdd(key string, vals ...interface{}) int {
+    slots := make([]string, 0, len(vals))
+    for i := 0; i < len(vals); i++ {
+        slots = append(slots,  "%v")
+    }
+    cmd := fmt.Sprintf("SADD %s %s", key, strings.Join(slots, " "))
+    rets, err := r.Exec(fmt.Sprintf(cmd, vals...))
+    if err == nil && len(rets) > 0 {
+        num, _ := strconv.ParseInt(rets[0], 10, 64)
+        return int(num)
+    }
+    return 0
+}
+
+func (r *Redis) SMembers(key string) []string {
+    cmd := "SMEMBERS " + key
+    rets, _ := r.Exec(cmd)
+    return rets
+}
+
 func Test() {
-    redis, _ := New("127.0.0.1", 6379)
+    redis, _ := New("127.0.0.1", 6379, 0)
 
     redis.Set("key3", 34323523)
     ret := redis.String("key3")
@@ -240,4 +263,15 @@ func Test() {
     log.Print(num)
 
     redis.LPush("list5", 4, 5, 6, 6, "aaa")
+
+    n := redis.SAdd("set_0", 1, 10, 33, "dd", "d3", 4, 5, 5)
+    rets := redis.SMembers("set_0")
+    log.Print(n, rets)
+
+    rets = redis.LRange("list", 0, -1)
+    log.Print(rets)
+
+    redis.SetDB(1)
+    v := redis.BLPop("list", 0)
+    log.Print(v, "--------")
 }

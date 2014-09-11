@@ -2,7 +2,7 @@ package main
 
 
 import (
-    "github.com/roydong/gofs/lib/redis"
+    "github.com/roydong/gos/lib/redis"
 )
 
 
